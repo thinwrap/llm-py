@@ -1,0 +1,69 @@
+name: Publish to PyPI
+
+# Trusted-publisher (OIDC) publish to PyPI — no API token, no stored secret.
+#
+# PyPI supports a "pending" trusted publisher: configure it on PyPI BEFORE the
+# project exists (pypi.org -> Account settings -> Publishing -> "Add a pending
+# publisher") pointing at PyPI project `thinwrap-llm`, owner `thinwrap`,
+# repository `llm-py`, workflow `release.yml`, environment left blank. The first
+# `v*.*.*` tag push then both creates the project and publishes it — no manual
+# bootstrap. This is the Python analogue of npm OIDC trusted publishing.
+#
+# The publish job runs the lib's own gates (import smoke + coverage) against the
+# tagged commit before building, so a red release never reaches PyPI.
+#
+# Trigger: push of a `v*.*.*` tag (branch protection on `main` ensures the
+# tag's commit is on a protected branch).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build, gate, publish thinwrap-llm
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # required for PyPI OIDC trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify git tag matches pyproject version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (=$tag_version) does not match pyproject version $pkg_version"
+            exit 1
+          fi
+
+      - name: Install (with dev extras) + build backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install build
+
+      - name: Offline import smoke (zero import-time egress)
+        run: python -c "import thinwrap.llm; print('import ok')"
+
+      - name: Test + coverage gate (>=80%)
+        run: pytest --cov=thinwrap.llm --cov-report=term-missing --cov-fail-under=80
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Publish to PyPI (OIDC trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
