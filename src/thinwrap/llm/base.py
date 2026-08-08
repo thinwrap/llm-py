@@ -50,6 +50,12 @@ class BaseConnector:
         except ConnectorError:
             raise
         except Exception as exc:
+            # …unless the provider answered and the transport raised the non-2xx
+            # instead of returning it. A non-2xx never streams anyway, so a
+            # buffered wrapper is the faithful shape for the connector to map.
+            rebuilt = _response_from_raised_http_error(exc)
+            if rebuilt is not None:
+                return BufferedStream(rebuilt)
             descriptor, cause = _sanitize_transport_error(exc)
         # Raised OUTSIDE the except block on purpose: implicit exception chaining
         # only happens while an exception is handled, so neither __cause__ nor
@@ -63,6 +69,9 @@ class BaseConnector:
         except ConnectorError:
             raise
         except Exception as exc:
+            rebuilt = _response_from_raised_http_error(exc)
+            if rebuilt is not None:
+                return rebuilt
             descriptor, cause = _sanitize_transport_error(exc)
         # Raised OUTSIDE the except block — see open_post_stream for why.
         raise ConnectorError(ProviderCode.PROVIDER_UNAVAILABLE, message=descriptor, provider_message=descriptor, cause=cause)
@@ -106,3 +115,80 @@ def _sanitize_transport_error(exc: BaseException) -> tuple[str, dict[str, Any]]:
     query-credential provider would leak the secret via the message and cause."""
     descriptor = f"Upstream transport error ({type(exc).__name__})"
     return descriptor, {"raw": {"exception": type(exc).__name__}}
+
+
+def _response_from_raised_http_error(exc: BaseException) -> Optional[HttpResponse]:
+    """Rebuild an :class:`HttpResponse` from an exception that carries one, or
+    return ``None`` when the failure is a genuine transport failure.
+
+    :class:`Transport` requires a non-2xx to be RETURNED, and the bundled
+    urllib transport obeys that. A BYO transport may not: ``requests`` and
+    ``httpx`` both raise from ``raise_for_status()``, and a thin urllib wrapper
+    can let :class:`urllib.error.HTTPError` escape. The provider answered, so the
+    answer is what the caller must see — without this, every 401/429/503
+    collapses into ``provider_unavailable`` with no status, and a rate-limited
+    caller cannot tell that it should back off.
+
+    Duck-typed on the shape (``.response.status_code``, ``.code`` + ``.read()``),
+    never on an import: the library has zero runtime dependencies."""
+    for candidate in (getattr(exc, "response", None), exc):
+        if candidate is None:
+            continue
+        status = _read_http_status(candidate)
+        if status is None:
+            continue
+        return HttpResponse(
+            status=status,
+            headers=_read_http_headers(candidate),
+            body=_read_http_body(candidate),
+        )
+    return None
+
+
+def _read_http_status(candidate: Any) -> Optional[int]:
+    """The HTTP status a response-like object carries, if it plausibly is one."""
+    status = getattr(candidate, "status_code", None)
+    if status is None:
+        status = getattr(candidate, "status", None)
+    if status is None and (hasattr(candidate, "read") or hasattr(candidate, "headers")):
+        # `code` alone is too generic to trust — urllib.error.HTTPError pairs it
+        # with a readable body, an unrelated exception with a `.code` does not.
+        status = getattr(candidate, "code", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    return status if 200 <= status <= 599 else None
+
+
+def _read_http_headers(candidate: Any) -> dict:
+    headers = getattr(candidate, "headers", None)
+    if headers is None:
+        return {}
+    try:
+        items = headers.items()
+    except Exception:
+        return {}
+    return {str(k).lower(): str(v) for k, v in items}
+
+
+def _read_http_body(candidate: Any) -> bytes:
+    for attribute in ("content", "text", "body"):
+        try:
+            value = getattr(candidate, attribute, None)
+        except Exception:
+            # httpx raises on `.content` for an unread streaming response.
+            continue
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8", "replace")
+    read = getattr(candidate, "read", None)
+    if callable(read):
+        try:
+            value = read()
+        except Exception:
+            return b""
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8", "replace")
+    return b""

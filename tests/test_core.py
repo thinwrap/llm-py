@@ -4,6 +4,7 @@ error mapping, SSE parsing, and SigV4 structure."""
 from __future__ import annotations
 
 import datetime as dt
+import types
 
 import pytest
 from helpers import FakeTransport, body_json, path_of, resp
@@ -276,3 +277,69 @@ def test_sigv4_structure():
     assert "content-type;host;x-amz-content-sha256;x-amz-date" in auth
     assert h1 == h2
     assert len(auth.split("Signature=")[1]) == 64
+
+
+# ---------------------------------------------------------------------------
+# Transport contract: a BYO transport that RAISES a non-2xx
+# ---------------------------------------------------------------------------
+#
+# `Transport` requires a non-2xx to be returned. `requests`/`httpx` transports
+# calling raise_for_status() do not — and without recovery every provider error
+# collapses into provider_unavailable with no status. For an LLM caller that is
+# the worst possible misreport: a rate limit becomes an outage, so the caller
+# fails the request instead of backing off.
+
+
+class _RaisingTransport:
+    """Shape of requests/httpx: the exception carries a `.response`."""
+
+    def __init__(self, status: int, payload: bytes) -> None:
+        self._status = status
+        self._payload = payload
+
+    def send(self, request):
+        error = RuntimeError(f"{self._status} Client Error for url: {request.url}")
+        error.response = types.SimpleNamespace(
+            status_code=self._status,
+            headers={"Content-Type": "application/json"},
+            content=self._payload,
+        )
+        raise error
+
+    def open_stream(self, request):
+        return self.send(request)
+
+
+def test_raised_429_still_classifies_as_rate_limited():
+    transport = _RaisingTransport(429, b'{"error":{"message":"Rate limit reached"}}')
+    with pytest.raises(llm.ConnectorError) as excinfo:
+        _openai(transport).complete(llm.ChatInput(model="m", messages=[llm.ChatMessage(role="user", content="hi")]))
+    error = excinfo.value
+    assert error.status_code == 429
+    assert error.provider_code is llm.ProviderCode.RATE_LIMITED
+    assert "Rate limit reached" in (error.provider_message or "")
+
+
+def test_raised_401_on_a_stream_still_classifies_as_auth_failed():
+    # A non-2xx never streams, so the buffered wrapper is the faithful shape.
+    transport = _RaisingTransport(401, b'{"error":{"message":"Invalid API key"}}')
+    with pytest.raises(llm.ConnectorError) as excinfo:
+        for _ in _openai(transport).stream(
+            llm.ChatInput(model="m", messages=[llm.ChatMessage(role="user", content="hi")])
+        ):
+            pass
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.provider_code is llm.ProviderCode.AUTH_FAILED
+
+
+def test_transport_failure_without_a_status_stays_provider_unavailable():
+    class _DeadTransport:
+        def send(self, request):
+            raise OSError("connection reset by peer")
+
+    with pytest.raises(llm.ConnectorError) as excinfo:
+        _openai(_DeadTransport()).complete(
+            llm.ChatInput(model="m", messages=[llm.ChatMessage(role="user", content="hi")])
+        )
+    assert excinfo.value.provider_code is llm.ProviderCode.PROVIDER_UNAVAILABLE
+    assert excinfo.value.status_code is None
