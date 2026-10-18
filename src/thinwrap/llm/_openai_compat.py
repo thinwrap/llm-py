@@ -18,7 +18,7 @@ from .chat import (
     ToolCallDelta,
     Usage,
 )
-from .errors import ProviderCode, empty_body_error, invalid_request, vendor_error
+from .errors import ProviderCode, embedded_error_class, empty_body_error, invalid_request, vendor_error
 from .passthrough import apply_body, merge_headers
 from .spec import OpenAICompatSpec
 
@@ -45,20 +45,25 @@ class OpenAICompatConnector(BaseConnector):
             raise self._error(resp.status, resp.headers, raw)
         if raw is None:
             raise empty_body_error(resp.status)
+        self._check_success_body(resp.status, resp.headers, raw)
         return self._parse_result(raw, msg.model)
 
     def stream(self, msg: ChatInput) -> Iterator[ChatStreamDelta]:
         url, body, headers = self._build_request(msg, stream=True)
         stream = self.open_post_stream(url, body, headers)
         if not ok_status(stream.status):
-            raw = decode_json(stream.read_all())
-            stream.close()
+            raw = self._read_error_body(stream)
             raise self._error(stream.status, stream.headers, raw)
+        self._require_event_stream(stream)
         return self._iter_stream(stream)
 
     def _iter_stream(self, stream) -> Iterator[ChatStreamDelta]:
+        # A complete stream ends on [DONE], and its last choice chunk carries a
+        # finish_reason; either one proves the answer was not cut off.
+        state: dict = {"saw_done": False}
+        saw_finish = False
         try:
-            for payload in self._iter_sse(stream):
+            for payload in self._iter_sse(stream, state):
                 try:
                     chunk = json.loads(payload)
                 except (ValueError, TypeError):
@@ -69,7 +74,11 @@ class OpenAICompatConnector(BaseConnector):
                 if isinstance(chunk, dict) and chunk.get("error") is not None:
                     raise self._error(stream.status, stream.headers, chunk, _stream_error_code(chunk))
                 for delta in self._map_stream_chunk(chunk):
+                    if delta.finish_reason:
+                        saw_finish = True
                     yield delta
+            if not state["saw_done"] and not saw_finish:
+                raise self._stream_ended_early_error()
         finally:
             stream.close()
 
@@ -111,6 +120,30 @@ class OpenAICompatConnector(BaseConnector):
             url += "?" + urlencode(dict(msg.passthrough.query))
         return url, body, headers
 
+    def _check_success_body(self, status: int, headers, raw: Any) -> None:
+        """A 2xx is not proof of success: OpenRouter reports a failure after
+        processing started as HTTP 200 with either only an ``error`` object, or
+        ``choices[0]`` carrying ``finish_reason: "error"`` + ``error`` beside
+        partial content. Without a choice there is no result to return at all."""
+        err = jget(raw, "error")
+        if err is not None:
+            raise self._embedded_error(status, headers, raw, err)
+        choices = jlist(jget(raw, "choices"))
+        if not choices:
+            raise empty_body_error(status)
+        choice_err = jget(choices[0], "error")
+        if choice_err is not None or jstr(jget(choices[0], "finish_reason")) == "error":
+            raise self._embedded_error(status, headers, raw, choice_err)
+
+    def _embedded_error(self, status: int, headers, raw: Any, err: Any):
+        msg = extract_error_message({"error": err})
+        # The status code is the HTTP status the response arrived with (the 2xx),
+        # as for a mid-stream frame; the embedded code or type only classifies.
+        # Without one the error says nothing classifiable.
+        effective = embedded_error_class(err)
+        code = ProviderCode.UNKNOWN if effective is None else _map_code(effective, {"error": err})
+        return vendor_error(status, headers, raw, code, msg)
+
     def _parse_result(self, raw: Any, requested_model: str) -> ChatResult:
         choices = jlist(jget(raw, "choices")) or []
         choice = choices[0] if choices else None
@@ -119,7 +152,7 @@ class OpenAICompatConnector(BaseConnector):
         for tc in jlist(jget(m, "tool_calls")) or []:
             tool_calls.append(_parse_tool_call(tc))
         return ChatResult(
-            message=AssistantMessage(role="assistant", content=jstr(jget(m, "content")), tool_calls=tool_calls),
+            message=AssistantMessage(role="assistant", content=_content_text(jget(m, "content")), tool_calls=tool_calls),
             finish_reason=_map_finish_reason(jstr(jget(choice, "finish_reason"))),
             usage=_map_usage(jget(raw, "usage")),
             model=jstr(jget(raw, "model")) or requested_model,
@@ -132,7 +165,7 @@ class OpenAICompatConnector(BaseConnector):
         choices = jlist(jget(chunk, "choices")) or []
         choice = choices[0] if choices else None
         delta = jget(choice, "delta")
-        content = jstr(jget(delta, "content"))
+        content = _content_text(jget(delta, "content"))
         if content:
             base.content_delta = content
             has = True
@@ -176,18 +209,25 @@ class OpenAICompatConnector(BaseConnector):
 
 
 def _stream_error_code(body: Any) -> ProviderCode:
-    """Classify a provider error object delivered mid-stream (after HTTP 200): the
-    stream's status is a success code, so derive the code from the error message."""
-    msg = extract_error_message(body).lower()
-    if "rate limit" in msg or "rate_limit" in msg or "too many requests" in msg or "quota" in msg:
-        return ProviderCode.RATE_LIMITED
-    if "context length" in msg or "maximum context" in msg or "context_length" in msg:
-        return ProviderCode.CONTEXT_LENGTH_EXCEEDED
-    if "content" in msg and "filter" in msg:
-        return ProviderCode.CONTENT_FILTERED
-    # A mid-generation failure with no recognizable cause is an availability
-    # failure of this request, not a genuinely UNKNOWN one.
-    return ProviderCode.PROVIDER_UNAVAILABLE
+    """Classify a provider error object delivered mid-stream (after HTTP 200). The
+    stream's status is a success code, so the frame's own ``code`` / ``type``
+    decides (an HTTP status, or a name such as ``insufficient_quota``). A frame
+    with neither says nothing classifiable, so it is ``unknown``."""
+    effective = embedded_error_class(jget(body, "error"))
+    if effective is None:
+        return ProviderCode.UNKNOWN
+    return _map_code(effective, body)
+
+
+def _content_text(content: Any) -> str:
+    """Assistant text from ``message.content`` / ``delta.content``. Mistral
+    reasoning models return a list of chunks instead of a string — ``thinking``
+    chunks plus ``{"type":"text","text":...}`` answer chunks; only the answer is
+    content (the reasoning stays visible on ``raw``)."""
+    if isinstance(content, str):
+        return content
+    parts = jlist(content) or []
+    return "".join(jstr(jget(p, "text")) for p in parts if jget(p, "type") == "text")
 
 
 def _map_message(m: ChatMessage) -> dict:
@@ -206,7 +246,7 @@ def _map_message(m: ChatMessage) -> dict:
 
 def _map_content(m: ChatMessage):
     if m.content_parts:
-        parts = []
+        parts: list[dict[str, Any]] = []
         for p in m.content_parts:
             if p.type == "text":
                 parts.append({"type": "text", "text": p.text})
@@ -268,15 +308,38 @@ def _map_usage(u) -> Usage:
 def _map_code(status: int, body: Any) -> ProviderCode:
     if status in (401, 403):
         return ProviderCode.AUTH_FAILED
-    if status == 429:
+    # 402 (out of credits/balance on OpenRouter, DeepSeek, ...): OpenAI reports
+    # the same condition as 429 insufficient_quota, so it classifies the same way.
+    if status in (402, 429):
         return ProviderCode.RATE_LIMITED
-    if status >= 500:
+    # 408 is a timeout on the provider's side; a retry can succeed.
+    if status >= 500 or status == 408:
         return ProviderCode.PROVIDER_UNAVAILABLE
-    if status in (400, 404, 422):
-        msg = extract_error_message(body).lower()
-        if "context length" in msg or "maximum context" in msg or "context_length" in msg:
+    if status >= 400:
+        if _is_context_overflow(body):
             return ProviderCode.CONTEXT_LENGTH_EXCEEDED
-        if "content" in msg and "filter" in msg:
+        if _is_content_filter(extract_error_message(body)):
             return ProviderCode.CONTENT_FILTERED
+        # 404, 413, 422, …: the request cannot succeed as sent.
         return ProviderCode.INVALID_REQUEST
     return ProviderCode.UNKNOWN
+
+
+def _is_context_overflow(body: Any) -> bool:
+    # OpenAI's documented code first; other compat servers only word it.
+    if jget(jget(body, "error"), "code") == "context_length_exceeded":
+        return True
+    msg = extract_error_message(body).lower()
+    return "context length" in msg or "maximum context" in msg or "context_length" in msg
+
+
+def _is_content_filter(message: str) -> bool:
+    # OpenAI words a moderation refusal as content_policy_violation; Azure and
+    # others say "content filter"/"content_filter" or name the moderation step.
+    msg = message.lower()
+    return (
+        "content_policy" in msg
+        or "content policy" in msg
+        or "moderation" in msg
+        or ("content" in msg and "filter" in msg)
+    )

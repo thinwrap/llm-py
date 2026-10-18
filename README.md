@@ -36,6 +36,41 @@ for delta in chat.stream(ChatInput(model="gpt-4o-mini", messages=msgs)):
     print(delta.content_delta, end="", flush=True)
 ```
 
+A stream that is cut off before the provider's terminal event, or a 2xx answer
+that is not `text/event-stream`, raises `ConnectorError` (`provider_unavailable`)
+rather than ending as if it were complete.
+
+## Usage
+
+`res.usage` counts every billed token: `input_tokens` includes cache reads and
+writes (Anthropic, Bedrock), `output_tokens` includes thinking tokens (Gemini), and
+`total_tokens` is the vendor's total, or input + output when it reports none. When
+streaming, `usage` arrives once, on the terminal delta.
+
+## Tool loops and `provider_metadata`
+
+Some providers need opaque state from a response sent back on the next turn:
+Gemini 3 rejects a replayed function call without its thought signature, and
+Anthropic keeps its thinking blocks only if they are replayed verbatim.
+`ToolCall.provider_metadata` and `AssistantMessage.provider_metadata` carry that
+state, keyed by provider id (`{"gemini": {...}}`, `{"anthropic": {...}}`). Treat it
+as opaque and copy it into the next request together with `content` and
+`tool_calls`:
+
+```python
+res = chat.complete(ChatInput(model=model, messages=msgs, tools=tools))
+msgs.append(ChatMessage(role="assistant", content=res.message.content,
+                        tool_calls=res.message.tool_calls,
+                        provider_metadata=res.message.provider_metadata))
+```
+
+When streaming, the state rides on `tool_call_delta.provider_metadata` (copy it
+onto the `ToolCall` you assemble) and on the terminal delta's `provider_metadata`.
+A connector reads only its own key, so a history survives a provider switch. If the
+state is lost, Gemini falls back to Google's documented signature bypass, and
+Anthropic rebuilds that turn and every later one without their thinking (Anthropic
+invalidates thinking after a stripped turn), so the earlier reasoning is lost.
+
 ## Providers
 
 The **provider id selects the connector**; `ChatInput` / `ChatResult` are
@@ -82,7 +117,14 @@ Every failure raises `ConnectorError`: `provider_code` is one of `rate_limited`,
 `auth_failed`, `provider_unavailable`, `invalid_request`,
 `context_length_exceeded`, `content_filtered`, `unknown`. The raw `Retry-After`
 rides in `cause["retryAfter"]` (+ parsed `cause["retryAfterSeconds"]`) — there is
-no top-level retry attribute.
+no top-level retry attribute. `retryAfterSeconds` is set only for an integer delay
+or an HTTP-date (`0` when the date has passed).
+
+By HTTP status: `401`/`403` → `auth_failed`; `402` (out of credit) / `429` →
+`rate_limited`; `408` / `5xx` → `provider_unavailable`; every other `4xx` →
+`invalid_request`, unless the vendor's context-overflow or content-filter signal
+matches. An error delivered inside a 2xx body or mid-stream keeps the HTTP status it
+arrived with and is classified by its own code or type (`unknown` without one).
 
 ## Bring your own transport
 
@@ -92,9 +134,12 @@ chat = Chat(ProviderID.OPENAI, OpenAICompatConfig(api_key="..."), transport=my_t
 
 `my_transport` implements `Transport` (`send(HttpRequest) -> HttpResponse`); add
 an `open_stream` method for true incremental streaming (otherwise a buffered
-fallback is used). The default stdlib `urllib` transport does both and never
-follows redirects. The wrapper is stateless — no caching, retries, or
-conversation memory.
+fallback is used). The default stdlib `urllib` transport does both, never
+follows redirects, and is HTTPS-only: the `http://` defaults of the local servers
+(vLLM, Ollama, LM Studio) get an `invalid_request` telling you to bring your own
+transport. Its socket timeout is 600 s per blocking read, so a long non-streaming
+reasoning call is not cut off; pass `UrllibTransport(timeout=...)` for a different
+budget. The wrapper is stateless — no caching, retries, or conversation memory.
 
 ## Relationship to the siblings
 

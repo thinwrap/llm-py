@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
-from typing import Any, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 
+from .config import AnthropicConfig, BedrockConfig, GeminiConfig, OpenAICompatConfig
 from .enums import ProviderID
 from .errors import invalid_request
 from .passthrough import Passthrough
@@ -39,6 +40,10 @@ class ToolCall:
     id: str
     name: str
     arguments: str  # JSON-encoded arguments string
+    # Opaque per-provider state keyed by provider id (e.g. Gemini's
+    # thoughtSignature). Copy it back unchanged when replaying the call; a
+    # connector reads only its own key, so a history survives a provider switch.
+    provider_metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -52,6 +57,9 @@ class ChatMessage:
     tool_calls: List[ToolCall] = field(default_factory=list)
     tool_call_id: str = ""
     name: str = ""
+    # Opaque per-provider state of an assistant turn (e.g. Anthropic thinking
+    # blocks), copied from AssistantMessage.provider_metadata.
+    provider_metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -110,6 +118,7 @@ class AssistantMessage:
     role: str
     content: str
     tool_calls: List[ToolCall] = field(default_factory=list)
+    provider_metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -127,6 +136,8 @@ class ToolCallDelta:
     id: str = ""
     function_name: str = ""
     arguments_delta: str = ""
+    # Copy onto the assembled ToolCall (see ToolCall.provider_metadata).
+    provider_metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -136,6 +147,9 @@ class ChatStreamDelta:
     finish_reason: str = ""
     usage: Optional[Usage] = None
     raw: Any = None
+    # Set on the terminal delta only; the message-level counterpart of
+    # AssistantMessage.provider_metadata.
+    provider_metadata: Optional[Dict[str, Any]] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +168,13 @@ class Chat:
     output shapes are identical across every provider. Switching vendor is a
     change of id + model only."""
 
-    def __init__(self, provider_id, config, *, transport: Optional[Transport] = None) -> None:
+    def __init__(
+        self,
+        provider_id: ProviderID | str,
+        config: OpenAICompatConfig | AnthropicConfig | BedrockConfig | GeminiConfig,
+        *,
+        transport: Optional[Transport] = None,
+    ) -> None:
         try:
             self.provider_id = ProviderID(provider_id)
         except ValueError:

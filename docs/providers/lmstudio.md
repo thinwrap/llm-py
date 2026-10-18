@@ -25,7 +25,7 @@ print(res.message.content, res.usage.total_tokens)
 | `base_url` | `str` | No* | Overrides the default `http://localhost:1234/v1`. *Required if not on `:1234`. |
 | `headers` | `Mapping[str, str]` | No | Merged onto every request. |
 
-Inject a custom transport with `Chat(ProviderID.LMSTUDIO, cfg, transport=my_transport)`; the default `UrllibTransport` never follows redirects.
+The default `UrllibTransport` is **HTTPS-only** (and never follows redirects), so it refuses the `http://` default with a `ConnectorError` (`invalid_request`) that says so. For a cleartext local server, inject your own transport: `Chat(ProviderID.LMSTUDIO, cfg, transport=my_transport)`, where `my_transport` implements `send(HttpRequest) -> HttpResponse` (and optionally `open_stream` for incremental streaming); or serve it behind HTTPS and set `base_url`.
 
 ## Auth setup
 

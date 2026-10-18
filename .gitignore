@@ -16,3 +16,7 @@ coverage.xml
 
 # macOS
 .DS_Store
+
+# IDE and editor settings
+.idea/
+.vscode/

@@ -44,6 +44,7 @@ Create a key at <https://console.mistral.ai/api-keys>. It is sent as `Authorizat
 - Because `stream_options.include_usage` is not sent, streaming `usage` is only present if Mistral includes it natively on the final chunk.
 - Model ids are date-stamped (e.g. `-YYMM`).
 - `max_output_tokens` maps to `max_tokens`. `reasoning.effort` maps to `reasoning_effort`.
+- With reasoning, Mistral returns `content` as a list of `thinking` + `text` chunks; `res.message.content` / `delta.content_delta` carry only the `text` chunks, and the reasoning stays on `raw`.
 - Streaming via `for delta in chat.stream(input): ...` (a generator).
 
 ## Embeddings
@@ -57,7 +58,7 @@ emb = Embeddings(ProviderID.MISTRAL, OpenAICompatConfig(api_key=os.environ["MIST
 res = emb.create(EmbeddingsInput(model="mistral-embed", input=["hello"]))
 ```
 
-`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: "float"`; `dimensions` maps to `dimensions` when set. Vectors are returned in input order on `res.embeddings`.
+`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: "float"`; `dimensions` maps to Mistral's `output_dimension` when set (models that support a configurable size, e.g. `codestral-embed`). Vectors are returned in input order on `res.embeddings`.
 
 ## Error mapping & passthrough
 

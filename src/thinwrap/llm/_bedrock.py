@@ -21,8 +21,9 @@ Not normalized here (passthrough/raw, never emulated): reasoning control
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterator, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ._awssigv4 import SigV4Params, build_canonical_query, sign_aws_v4
 from ._jsonpath import jget, jlist, jnum, jstr
@@ -46,6 +47,10 @@ from .passthrough import apply_body
 _DEFAULT_MAX_TOKENS = 4096
 # AWS service name folded into the SigV4 credential scope.
 _SERVICE = "bedrock"
+# An AWS region is lowercase DNS-label text (us-east-1, us-gov-west-1). It is
+# interpolated into the default host, so anything else could point the signed
+# request, session token included, at a host of the caller's input's choosing.
+_REGION_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 class BedrockConnector(BaseConnector):
@@ -56,15 +61,26 @@ class BedrockConnector(BaseConnector):
         if not isinstance(config, BedrockConfig):
             raise invalid_request("bedrock requires a BedrockConfig")
         self.cfg = config
+        if not isinstance(config.region, str) or not _REGION_RE.fullmatch(config.region):
+            raise invalid_request("Bedrock: `region` must be an AWS region name such as 'us-east-1'")
         origin = config.base_url or f"https://bedrock-runtime.{config.region}.amazonaws.com"
         self.origin = origin.rstrip("/")
-        from urllib.parse import urlsplit
-
-        self.host = urlsplit(self.origin).netloc
+        parts = urlsplit(self.origin)
+        self.host = parts.netloc
         if not self.host:
             raise invalid_request(
                 f"Bedrock: invalid `base_url`/`region` — could not derive a host from '{self.origin}'"
             )
+        # http.client omits a default port from the Host header it sends, so the
+        # signed host must omit it too or the signature never matches.
+        default_port = {"https": ":443", "http": ":80"}.get(parts.scheme.lower())
+        if default_port and self.host.endswith(default_port):
+            self.host = self.host[: -len(default_port)]
+        # A base_url may carry a path prefix (a gateway mount point). The wire
+        # URL already includes it via the origin; the signed canonical URI must
+        # include it too, each segment encoded once more as for the model id.
+        segments = [seg for seg in parts.path.split("/") if seg]
+        self.canonical_base_path = "".join("/" + quote(seg, safe="-_.~") for seg in segments)
 
     def complete(self, msg: ChatInput) -> ChatResult:
         url, body_bytes, headers = self._build_signed_request(msg)
@@ -74,7 +90,9 @@ class BedrockConnector(BaseConnector):
         raw = decode_json(resp.body)
         if not ok_status(resp.status):
             raise self._error(resp.status, resp.headers, raw)
-        if raw is None:
+        # A Converse response always carries an `output` object; without it this
+        # is not a result, and parsing it would fake an empty completion.
+        if raw is None or not isinstance(jget(raw, "output"), dict):
             raise empty_body_error(resp.status)
         return self._parse_result(raw, msg.model)
 
@@ -115,12 +133,11 @@ class BedrockConnector(BaseConnector):
         # colon-free id double-encodes to itself, so this is a no-op for those.
         encoded_model = quote(msg.model, safe="")
         wire_path = "/model/" + encoded_model + "/converse"
-        canonical_path = "/model/" + quote(encoded_model, safe="") + "/converse"
+        canonical_path = self.canonical_base_path + "/model/" + quote(encoded_model, safe="") + "/converse"
         # passthrough.query must be folded into BOTH the SigV4 canonical query
         # string and the wire URL — identical bytes (RFC3986-encoded, key-sorted)
         # — so the signature the server recomputes from the received query still
-        # matches. Dropping it (like the other adapters used to) or appending it
-        # unsigned would break the signature.
+        # matches. Appending it unsigned would break the signature.
         canonical_query = ""
         if msg.passthrough and msg.passthrough.query:
             canonical_query = build_canonical_query(dict(msg.passthrough.query))
@@ -129,16 +146,19 @@ class BedrockConnector(BaseConnector):
             url += "?" + canonical_query
 
         # Headers folded into the signature: Content-Type + config.headers +
-        # per-request passthrough headers (mirrors the TS `extra` set).
+        # per-request passthrough headers. Merged case-insensitively: the signer
+        # lowercases names, so "content-type" beside "Content-Type" would sign
+        # one value while a transport may send both (→ SignatureDoesNotMatch).
         extra: dict[str, str] = {"Content-Type": "application/json"}
-        if self.cfg.headers:
-            extra.update(self.cfg.headers)
+        for k, v in (self.cfg.headers or {}).items():
+            _set_header_ci(extra, k, v)
         if msg.passthrough and msg.passthrough.headers:
-            extra.update(msg.passthrough.headers)
+            for k, v in msg.passthrough.headers.items():
+                _set_header_ci(extra, k, v)
         # post_raw force-SENDS application/json; SIGN that same value so a
         # cfg/passthrough Content-Type override can't desync the signature from
         # what actually goes on the wire (→ SignatureDoesNotMatch).
-        extra["Content-Type"] = "application/json"
+        _set_header_ci(extra, "Content-Type", "application/json")
 
         signed = sign_aws_v4(
             SigV4Params(
@@ -162,7 +182,7 @@ class BedrockConnector(BaseConnector):
             # request header is a no-op, so drop it.
             if k.lower() == "host":
                 continue
-            headers[k] = v
+            _set_header_ci(headers, k, v)
         return url, body_bytes, headers
 
     def _build_request(self, msg: ChatInput) -> dict[str, Any]:
@@ -186,7 +206,9 @@ class BedrockConnector(BaseConnector):
             inference_config["stopSequences"] = list(msg.stop)
         body["inferenceConfig"] = inference_config
 
-        if msg.tools:
+        # Converse has no "none" tool choice; withholding the tools is the only
+        # way to keep the model from calling one.
+        if msg.tools and not (msg.tool_choice is not None and msg.tool_choice.mode == "none"):
             tools = []
             for t in msg.tools:
                 spec: dict[str, Any] = {"name": t.name}
@@ -226,9 +248,17 @@ class BedrockConnector(BaseConnector):
                 )
 
         usage = jget(raw, "usage")
-        in_tok = int(jnum(jget(usage, "inputTokens")))
+        # Cache reads and writes are billed input but reported apart from
+        # inputTokens; the normalized count includes them.
+        in_tok = int(
+            jnum(jget(usage, "inputTokens"))
+            + jnum(jget(usage, "cacheReadInputTokens"))
+            + jnum(jget(usage, "cacheWriteInputTokens"))
+        )
         out_tok = int(jnum(jget(usage, "outputTokens")))
-        total = int(jnum(jget(usage, "totalTokens"))) or (in_tok + out_tok)
+        # Derived rather than taken from totalTokens, so it always equals
+        # input + output under the cache-inclusive input above.
+        total = in_tok + out_tok
 
         return ChatResult(
             message=AssistantMessage(role="assistant", content="".join(text_parts), tool_calls=tool_calls),
@@ -240,10 +270,18 @@ class BedrockConnector(BaseConnector):
 
     def _error(self, status: int, headers, raw):
         msg = _extract_error(raw) or f"HTTP {status}"
-        return vendor_error(status, headers, raw, _map_code(status, msg), msg)
+        return vendor_error(status, headers, raw, _map_code(status, msg, _error_type(headers, raw)), msg)
 
 
 # ---- module-private mappers ----
+
+
+def _set_header_ci(headers: dict[str, str], name: str, value: str) -> None:
+    """Set a header, first dropping any entry whose name differs only in case,
+    so each header appears once whichever casing each source used (last wins)."""
+    for existing in [k for k in headers if k.lower() == name.lower()]:
+        del headers[existing]
+    headers[name] = value
 
 
 def _split_messages(messages: list[ChatMessage]):
@@ -286,7 +324,9 @@ def _map_content_blocks(m: ChatMessage) -> list[Any]:
     if m.content_parts:
         for p in m.content_parts:
             if p.type == "text":
-                blocks.append({"text": p.text})
+                # Converse rejects a blank text block, so an empty part is dropped.
+                if p.text:
+                    blocks.append({"text": p.text})
             else:
                 blocks.append(
                     {"image": {"format": _image_format(p.media_type), "source": {"bytes": p.base64}}}
@@ -321,7 +361,6 @@ def _map_tool_choice(tc) -> Optional[dict]:
         return {"any": {}}
     if tc.mode == "function":
         return {"tool": {"name": tc.function_name}}
-    # Bedrock has no "none"; omit toolChoice.
     return None
 
 
@@ -333,6 +372,8 @@ def _map_stop_reason(sr: str) -> str:
         "tool_use": "tool_calls",
         "content_filtered": "content_filter",
         "guardrail_intervened": "content_filter",
+        # The output was cut off by the context window rather than maxTokens.
+        "model_context_window_exceeded": "length",
     }.get(sr, "unknown")
 
 
@@ -365,26 +406,49 @@ def _extract_error(body: Any) -> str:
     return ""
 
 
-def _map_code(status: int, message: str) -> ProviderCode:
+def _error_type(headers: Any, body: Any) -> str:
+    """The AWS error shape name (``ThrottlingException``). restJson services put
+    it in the ``x-amzn-ErrorType`` header, sometimes followed by ``:<uri>``; a
+    body ``__type`` may carry a ``namespace#`` prefix."""
+    raw = ""
+    if headers:
+        raw = str(headers.get("x-amzn-errortype", "") or "")
+    if not raw and isinstance(body, dict):
+        raw = jstr(body.get("__type"))
+    return raw.split(":", 1)[0].rsplit("#", 1)[-1].strip()
+
+
+def _map_code(status: int, message: str, error_type: str = "") -> ProviderCode:
     if status in (401, 403):
         return ProviderCode.AUTH_FAILED
-    if status == 429:
+    if status == 429 or error_type == "ThrottlingException":
         return ProviderCode.RATE_LIMITED
-    if status >= 500:
+    # 408 ModelTimeoutException and 424 ModelErrorException are failures of the
+    # model behind the request, not of the request itself.
+    if status >= 500 or status in (408, 424):
         return ProviderCode.PROVIDER_UNAVAILABLE
     if status in (400, 404, 422):
         msg = message.lower()
         if "throttl" in msg:
             return ProviderCode.RATE_LIMITED
-        # Tight phrases only — bare "token"/"max" misclassified auth/validation
-        # 400s (mirrors the OpenAI-compat mapper's phrasing).
+        # Tight phrases only: Bedrock reports an oversized prompt as an ordinary
+        # ValidationException and relays the model provider's own wording, and a
+        # looser match ("token", "max", "too long") also hits validation errors a
+        # caller trimming history cannot fix.
         if (
-            "too long" in msg
-            or "too many tokens" in msg
-            or "maximum context" in msg
-            or "context length" in msg
-            or "context window" in msg
+            "input is too long" in msg
+            or "prompt is too long" in msg
+            or "too many input tokens" in msg
+            or "maximum context length" in msg
+            or "exceed context limit" in msg
         ):
             return ProviderCode.CONTEXT_LENGTH_EXCEEDED
+        return ProviderCode.INVALID_REQUEST
+    # 402 means the account is out of credit or quota. OpenAI (429
+    # insufficient_quota) and Gemini (RESOURCE_EXHAUSTED) already report that as
+    # rate-limited, so 402 classifies the same way.
+    if status == 402:
+        return ProviderCode.RATE_LIMITED
+    if status == 413:
         return ProviderCode.INVALID_REQUEST
     return ProviderCode.UNKNOWN

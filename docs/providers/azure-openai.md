@@ -45,7 +45,9 @@ Get the key + resource endpoint from the Azure portal. The connector sends it as
 
 - **`base_url` is required** (no fixed public default).
 - `model` is the per-resource **deployment name**, not a portable global model id.
-- `max_output_tokens` maps to `max_tokens`. `reasoning.effort` maps to `reasoning_effort`.
+- `max_output_tokens` maps to `max_completion_tokens` (Azure reasoning models accept only that on Chat Completions; the cap includes reasoning tokens). `reasoning.effort` maps to `reasoning_effort`.
+- `max_completion_tokens` needs the v1 API (`/openai/v1`, no `api-version`) or a dated `api-version` of `2024-09-01-preview` or later; Microsoft's API changelog adds it in `2024-09-01-preview`, so older dated versions predate it.
+- **Function tools together with reasoning:** current models (gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.6-*) reject function tools combined with reasoning on Chat Completions with a 400, and gpt-5.6 does so even when `reasoning` is unset. The workaround is `Passthrough(body={"reasoning_effort": "none"})`, accepted on gpt-5.4 and later (gpt-5-mini and o4-mini reject `"none"`). Moving this connector to the Responses API is planned.
 - Streaming via `for delta in chat.stream(input): ...` (a generator). `stream_options.include_usage` is set.
 
 ## Embeddings

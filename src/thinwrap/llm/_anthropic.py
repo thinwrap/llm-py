@@ -10,12 +10,15 @@ swappable via the Chat facade.
 
 Not normalized here (surfaced via ``raw`` or ``passthrough``, never emulated):
 response_format (Anthropic has none — use tool-based structured output via
-passthrough); reasoning CoT output (thinking blocks land in ``raw``); prompt
-caching (cache_control via passthrough, cached-token counts in ``raw``).
+passthrough); reasoning CoT output (thinking blocks land in ``raw``, and verbatim
+in ``provider_metadata["anthropic"]["content"]`` for replay); prompt caching
+(cache_control via passthrough; cache read/write tokens are counted in
+``usage.input_tokens``, the breakdown stays in ``raw``).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Iterator, Optional
 
@@ -37,7 +40,11 @@ from .passthrough import apply_body, merge_headers
 
 DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 DEFAULT_VERSION = "2023-06-01"
-DEFAULT_MAX_TOKENS = 4096
+# Used when the caller sets no max_tokens (Anthropic requires one). Current
+# models always think and default to medium effort, so a smaller ceiling often
+# ends at `length` before any text; max_tokens caps output, it is not billed as
+# such. 16000 is Anthropic's recommended non-streaming default.
+DEFAULT_MAX_TOKENS = 16000
 
 
 class AnthropicConnector(BaseConnector):
@@ -56,7 +63,9 @@ class AnthropicConnector(BaseConnector):
         raw = decode_json(resp.body)
         if not ok_status(resp.status):
             raise self._error(resp.status, resp.headers, raw)
-        if raw is None:
+        # A Messages response always carries a `content` array; without it this
+        # is not a result, and parsing it would fake an empty completion.
+        if raw is None or jlist(jget(raw, "content")) is None:
             raise empty_body_error(resp.status)
         return self._parse_result(raw, msg.model)
 
@@ -64,16 +73,25 @@ class AnthropicConnector(BaseConnector):
         url, body, headers = self._build_request(msg, stream=True)
         stream = self.open_post_stream(url, body, headers)
         if not ok_status(stream.status):
-            raw = decode_json(stream.read_all())
-            stream.close()
+            raw = self._read_error_body(stream)
             raise self._error(stream.status, stream.headers, raw)
+        self._require_event_stream(stream)
         return self._iter_stream(stream)
 
     def _iter_stream(self, stream) -> Iterator[ChatStreamDelta]:
-        # input_tokens is captured across events: message_start reports it,
-        # message_delta reads it back when it reports output_tokens (Anthropic's
-        # SSE is stateful).
-        input_tokens = 0
+        # Usage is merged across events field by field, as the official SDK's
+        # MessageStream does: message_start reports the counts, and message_delta
+        # restates some of them cumulatively; a field it omits or sends as null
+        # keeps the earlier value.
+        usage_fields: dict[str, float] = {}
+        # The response's content blocks, rebuilt from the events in block order
+        # so the terminal delta can carry them for verbatim replay (the same
+        # array a non-stream call returns).
+        blocks: dict[int, dict[str, Any]] = {}
+        partial_json: dict[int, str] = {}
+        # A complete stream reports its stop_reason on message_delta and closes
+        # with message_stop; without either the answer was cut off.
+        saw_stop = False
         # Anthropic indexes CONTENT BLOCKS (text + tool_use interleaved), so the
         # first tool call can arrive at block index 1. Normalize to a 0-based
         # tool-call-relative index (matching the OpenAI-compat surface and the other
@@ -93,13 +111,17 @@ class AnthropicConnector(BaseConnector):
                 if typ == "error":
                     raise self._error(stream.status, stream.headers, evt, _stream_error_code(evt))
                 if typ == "message_start":
-                    usage = jget(jget(evt, "message"), "usage")
-                    input_tokens = int(jnum(jget(usage, "input_tokens")))
+                    _merge_usage(usage_fields, jget(jget(evt, "message"), "usage"))
                     continue
                 if typ == "content_block_start":
                     cb = jget(evt, "content_block")
+                    block = int(jnum(jget(evt, "index")))
+                    if isinstance(cb, dict):
+                        blocks[block] = copy.deepcopy(cb)
+                        if "input" in cb or jstr(cb.get("type")).endswith("tool_use"):
+                            # The input arrives as input_json_delta fragments.
+                            partial_json[block] = ""
                     if jstr(jget(cb, "type")) == "tool_use":
-                        block = int(jnum(jget(evt, "index")))
                         tool_index_by_block[block] = next_tool_index
                         yield ChatStreamDelta(
                             tool_call_delta=ToolCallDelta(
@@ -114,30 +136,43 @@ class AnthropicConnector(BaseConnector):
                 if typ == "content_block_delta":
                     d = jget(evt, "delta")
                     dtype = jstr(jget(d, "type"))
+                    block = int(jnum(jget(evt, "index")))
+                    _accumulate_block(blocks.get(block), partial_json, block, d)
                     if dtype == "text_delta":
                         s = jstr(jget(d, "text"))
                         if s:
                             yield ChatStreamDelta(content_delta=s, raw=evt)
                     elif dtype == "input_json_delta":
                         pj = jget(d, "partial_json")
-                        if isinstance(pj, str):
-                            block = int(jnum(jget(evt, "index")))
+                        # Server-tool blocks (server_tool_use) stream their input
+                        # the same way but are not caller tool calls.
+                        if isinstance(pj, str) and block in tool_index_by_block:
                             yield ChatStreamDelta(
-                                tool_call_delta=ToolCallDelta(index=tool_index_by_block.get(block, 0), arguments_delta=pj),
+                                tool_call_delta=ToolCallDelta(index=tool_index_by_block[block], arguments_delta=pj),
                                 raw=evt,
                             )
-                    # thinking_delta → CoT output not normalized; available only via raw.
+                    # thinking_delta → CoT output not normalized; available via
+                    # raw and the terminal provider_metadata.
                     continue
                 if typ == "message_delta":
                     out = ChatStreamDelta(raw=evt)
                     sr = jstr(jget(jget(evt, "delta"), "stop_reason"))
+                    _merge_usage(usage_fields, jget(evt, "usage"))
+                    in_tok = _input_tokens(usage_fields)
+                    out_tok = int(usage_fields.get("output_tokens", 0))
+                    out.usage = Usage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=in_tok + out_tok)
                     if sr:
                         out.finish_reason = _map_stop_reason(sr)
-                    out_tok = int(jnum(jget(jget(evt, "usage"), "output_tokens")))
-                    out.usage = Usage(input_tokens=input_tokens, output_tokens=out_tok, total_tokens=input_tokens + out_tok)
+                        saw_stop = True
+                        # Only the terminal delta carries the turn's blocks.
+                        out.provider_metadata = {"anthropic": {"content": _finish_blocks(blocks, partial_json)}}
                     yield out
                     continue
-                # message_stop / content_block_stop / ping → ignored
+                if typ == "message_stop":
+                    saw_stop = True
+                # content_block_stop / ping → ignored
+            if not saw_stop:
+                raise self._stream_ended_early_error()
         finally:
             stream.close()
 
@@ -151,31 +186,11 @@ class AnthropicConnector(BaseConnector):
     def _build_request(self, msg: ChatInput, stream: bool):
         system, messages = _split_messages(msg.messages)
 
-        thinking: Optional[dict[str, Any]] = None
-        budget = 0
-        if msg.reasoning is not None:
-            budget = _effort_budget(msg.reasoning.effort)
-            thinking = {"type": "enabled", "budget_tokens": budget}
-
         max_tokens = DEFAULT_MAX_TOKENS
         if self.cfg.default_max_tokens > 0:
             max_tokens = self.cfg.default_max_tokens
-        caller_set_max = msg.max_output_tokens is not None
-        if caller_set_max:
+        if msg.max_output_tokens is not None:
             max_tokens = msg.max_output_tokens
-        if thinking is not None and max_tokens <= budget:
-            # Anthropic requires max_tokens > thinking.budget_tokens (max_tokens is
-            # the TOTAL, thinking included). If the CALLER set an explicit
-            # max_output_tokens below the budget, silently inflating it would spend
-            # past their cap — raise instead so they lower reasoning.effort or raise
-            # the cap. Only a non-explicit default is inflated to keep the request valid.
-            if caller_set_max:
-                raise invalid_request(
-                    f"max_output_tokens ({max_tokens}) must be greater than the reasoning "
-                    f"budget ({budget}) for extended thinking — raise max_output_tokens "
-                    f"or lower reasoning.effort"
-                )
-            max_tokens = budget + DEFAULT_MAX_TOKENS
 
         body: dict[str, Any] = {"model": msg.model, "max_tokens": max_tokens, "messages": messages}
         if system:
@@ -195,9 +210,16 @@ class AnthropicConnector(BaseConnector):
             if tc is not None:
                 body["tool_choice"] = tc
 
-        if thinking is not None:
-            # Extended thinking requires temperature=1 and disallows top_p/top_k — omit sampling.
-            body["thinking"] = thinking
+        if msg.reasoning is not None:
+            # Adaptive thinking is the current-generation control: the model sizes
+            # its own thinking from the effort, so there is no budget to fit under
+            # max_tokens. Claude 4.5 and older reject it with a 400; those models
+            # take budget thinking via passthrough. Thinking also rules out
+            # custom sampling, so temperature/top_p are omitted.
+            body["thinking"] = {"type": "adaptive"}
+            # An empty effort means "unspecified", so the documented default
+            # applies; any other value is sent as given for Anthropic to validate.
+            body["output_config"] = {"effort": msg.reasoning.effort or "medium"}
         else:
             if msg.temperature is not None:
                 body["temperature"] = msg.temperature
@@ -222,7 +244,8 @@ class AnthropicConnector(BaseConnector):
     def _parse_result(self, raw: Any, requested_model: str) -> ChatResult:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        for b in jlist(jget(raw, "content")) or []:
+        content = jlist(jget(raw, "content")) or []
+        for b in content:
             btype = jstr(jget(b, "type"))
             if btype == "text":
                 text_parts.append(jstr(jget(b, "text")))
@@ -233,12 +256,17 @@ class AnthropicConnector(BaseConnector):
                 tool_calls.append(
                     ToolCall(id=jstr(jget(b, "id")), name=jstr(jget(b, "name")), arguments=_dump_json(inp))
                 )
-            # thinking blocks → raw only
+            # thinking blocks → raw + provider_metadata only
         usage = jget(raw, "usage")
-        in_tok = int(jnum(jget(usage, "input_tokens")))
+        in_tok = _input_tokens(usage)
         out_tok = int(jnum(jget(usage, "output_tokens")))
         return ChatResult(
-            message=AssistantMessage(role="assistant", content="".join(text_parts), tool_calls=tool_calls),
+            message=AssistantMessage(
+                role="assistant",
+                content="".join(text_parts),
+                tool_calls=tool_calls,
+                provider_metadata={"anthropic": {"content": copy.deepcopy(content)}},
+            ),
             finish_reason=_map_stop_reason(jstr(jget(raw, "stop_reason"))),
             usage=Usage(input_tokens=in_tok, output_tokens=out_tok, total_tokens=in_tok + out_tok),
             model=jstr(jget(raw, "model")) or requested_model,
@@ -264,12 +292,86 @@ def _stream_error_code(evt: Any) -> ProviderCode:
     if etype in ("authentication_error", "permission_error"):
         return ProviderCode.AUTH_FAILED
     if etype == "invalid_request_error":
-        msg = extract_error_message(evt).lower()
-        if "too long" in msg or "context" in msg or "max_tokens" in msg:
+        if _is_context_overflow(extract_error_message(evt)):
             return ProviderCode.CONTEXT_LENGTH_EXCEEDED
         return ProviderCode.INVALID_REQUEST
-    # overloaded_error / api_error / anything else → availability failure.
-    return ProviderCode.PROVIDER_UNAVAILABLE
+    if etype == "billing_error":
+        # The streamed form of a 402; classified the same way.
+        return ProviderCode.RATE_LIMITED
+    if etype in ("not_found_error", "request_too_large", "conflict_error"):
+        return ProviderCode.INVALID_REQUEST
+    if etype in ("overloaded_error", "api_error", "timeout_error"):
+        return ProviderCode.PROVIDER_UNAVAILABLE
+    # A frame without a recognizable type says nothing classifiable.
+    return ProviderCode.UNKNOWN
+
+
+def _is_context_overflow(message: str) -> bool:
+    """Anthropic reports a context overflow as a plain invalid_request_error, so
+    only its own wording ("prompt is too long: N tokens > M maximum", "input
+    length and `max_tokens` exceed context limit") tells it apart. Looser
+    matches ("context", "max_tokens") also hit ordinary validation errors, and a
+    caller that trims history on this code would then loop forever."""
+    msg = message.lower()
+    return "prompt is too long" in msg or "exceed context limit" in msg
+
+
+def _merge_usage(fields: dict[str, float], usage: Any) -> None:
+    if not isinstance(usage, dict):
+        return
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[key] = v
+
+
+def _input_tokens(usage: Any) -> int:
+    """Every input token billed for the request. Anthropic reports cache reads
+    and cache writes apart from ``input_tokens``; the normalized count includes
+    them so it means the same thing across providers."""
+    return int(
+        jnum(jget(usage, "input_tokens"))
+        + jnum(jget(usage, "cache_read_input_tokens"))
+        + jnum(jget(usage, "cache_creation_input_tokens"))
+    )
+
+
+def _accumulate_block(block: Any, partial_json: dict[int, str], index: int, delta: Any) -> None:
+    if not isinstance(block, dict):
+        return
+    dtype = jstr(jget(delta, "type"))
+    if dtype == "text_delta":
+        block["text"] = jstr(block.get("text")) + jstr(jget(delta, "text"))
+    elif dtype == "thinking_delta":
+        block["thinking"] = jstr(block.get("thinking")) + jstr(jget(delta, "thinking"))
+    elif dtype == "signature_delta":
+        block["signature"] = jstr(jget(delta, "signature"))
+    elif dtype == "input_json_delta" and index in partial_json:
+        partial_json[index] += jstr(jget(delta, "partial_json"))
+    elif dtype == "citations_delta":
+        citation = jget(delta, "citation")
+        if citation is not None:
+            citations = block.get("citations")
+            if not isinstance(citations, list):
+                citations = []
+                block["citations"] = citations
+            citations.append(citation)
+
+
+def _finish_blocks(blocks: dict[int, dict[str, Any]], partial_json: dict[int, str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for index in sorted(blocks):
+        block = blocks[index]
+        if index in partial_json:
+            pj = partial_json[index]
+            if pj:
+                block["input"] = _safe_json_parse(pj)
+            elif not isinstance(block.get("input"), dict):
+                # No deltas followed: the input on content_block_start (if any)
+                # is the whole input.
+                block["input"] = {}
+        out.append(block)
+    return out
 
 
 def _dump_json(v: Any) -> str:
@@ -284,6 +386,11 @@ def _safe_json_parse(s: str) -> Any:
 def _split_messages(messages: list[ChatMessage]):
     system = ""
     out: list[dict[str, Any]] = []
+    # Anthropic invalidates every thinking block after a turn whose thinking was
+    # edited or stripped, and accounts that enforce preserved thinking reject
+    # replaying them with a 400. Once one assistant turn is rebuilt, every later
+    # one is rebuilt too.
+    rebuilt = False
     for m in messages:
         if m.role == "system":
             text = _content_to_text(m)
@@ -295,8 +402,41 @@ def _split_messages(messages: list[ChatMessage]):
             else:
                 out.append({"role": "user", "content": [block]})
         else:
-            out.append({"role": m.role, "content": _map_content_blocks(m)})
+            replay = None
+            if m.role == "assistant":
+                replay = None if rebuilt else _verbatim_content(m)
+                rebuilt = rebuilt or replay is None
+            out.append({"role": m.role, "content": replay if replay is not None else _map_content_blocks(m)})
     return system, out
+
+
+def _verbatim_content(m: ChatMessage) -> Optional[list[Any]]:
+    """The assistant turn exactly as Anthropic returned it, thinking blocks
+    included, when ``provider_metadata`` still describes this message: the same
+    tool_use ids in order with the same inputs, and the same text. A message
+    edited since (or built by hand, or from another provider) is rebuilt from
+    its normalized fields instead, which drops its thinking blocks; replaying
+    the stored blocks would silently undo the edit."""
+    meta = m.provider_metadata.get("anthropic") if isinstance(m.provider_metadata, dict) else None
+    content = jget(meta, "content")
+    if not isinstance(content, list) or not content:
+        return None
+    if not all(isinstance(b, dict) for b in content):
+        return None
+    tool_uses = [b for b in content if b.get("type") == "tool_use"]
+    if [jstr(b.get("id")) for b in tool_uses] != [tc.id for tc in m.tool_calls]:
+        return None
+    for block, tc in zip(tool_uses, m.tool_calls):
+        try:
+            args = json.loads(tc.arguments) if tc.arguments else {}
+        except (TypeError, ValueError):
+            return None
+        if block.get("input") != args:
+            return None
+    text = "".join(jstr(b.get("text")) for b in content if b.get("type") == "text")
+    if text != _content_to_text(m):
+        return None
+    return copy.deepcopy(content)
 
 
 def _content_to_text(m: ChatMessage) -> str:
@@ -310,7 +450,9 @@ def _map_content_blocks(m: ChatMessage) -> list[dict[str, Any]]:
     if m.content_parts:
         for p in m.content_parts:
             if p.type == "text":
-                blocks.append({"type": "text", "text": p.text})
+                # Anthropic rejects an empty text block, so an empty part is dropped.
+                if p.text:
+                    blocks.append({"type": "text", "text": p.text})
             else:
                 blocks.append(
                     {"type": "image", "source": {"type": "base64", "media_type": p.media_type, "data": p.base64}}
@@ -349,36 +491,36 @@ def _map_tool_choice(tc) -> Optional[dict[str, Any]]:
 def _map_stop_reason(sr: str) -> str:
     if sr in ("end_turn", "stop_sequence"):
         return "stop"
-    if sr == "max_tokens":
+    # model_context_window_exceeded: the output was cut off by the context
+    # window rather than max_tokens; for the caller both mean "truncated".
+    if sr in ("max_tokens", "model_context_window_exceeded"):
         return "length"
     if sr == "tool_use":
         return "tool_calls"
     if sr == "refusal":
         return "content_filter"
+    # pause_turn (a server-tool loop hit its iteration limit; send the turn back
+    # to continue) has no normalized counterpart.
     return "unknown"
-
-
-def _effort_budget(effort: str) -> int:
-    if effort == "low":
-        return 1024
-    if effort == "high":
-        return 12288
-    return 4096  # "medium" and any unset/unknown value
 
 
 def _map_code(status: int, message: str) -> ProviderCode:
     if status in (401, 403):
         return ProviderCode.AUTH_FAILED
-    if status == 429:
+    # 402 means the account is out of credit or quota. OpenAI (429
+    # insufficient_quota) and Gemini (RESOURCE_EXHAUSTED) already report that as
+    # rate-limited, so 402 classifies the same way.
+    if status in (402, 429):
         return ProviderCode.RATE_LIMITED
-    # Any 5xx is a provider-side failure. A fixed {500,502,503,529} whitelist
-    # dropped 504/520/522/524 (gateway / Cloudflare-origin) to Unknown, so a
-    # consumer's retry policy wouldn't fire on them.
-    if status >= 500:
+    # Any 5xx is a provider-side failure, including gateway and Cloudflare-origin
+    # statuses (504/520/522/524) a fixed whitelist would miss; 408 is a
+    # transient timeout.
+    if status >= 500 or status == 408:
         return ProviderCode.PROVIDER_UNAVAILABLE
-    if status in (400, 404, 413, 422):
-        msg = message.lower()
-        if "too long" in msg or "context" in msg or "max_tokens" in msg:
+    if status >= 400:
+        if _is_context_overflow(message):
             return ProviderCode.CONTEXT_LENGTH_EXCEEDED
+        # 404, 413 request_too_large (a byte limit, not a token one), 422, …:
+        # the request cannot succeed as sent.
         return ProviderCode.INVALID_REQUEST
     return ProviderCode.UNKNOWN

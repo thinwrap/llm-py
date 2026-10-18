@@ -62,5 +62,6 @@ res = emb.create(EmbeddingsInput(model="openai/text-embedding-3-small", input=["
 ## Error mapping & passthrough
 
 - A non-2xx response raises a `ConnectorError`; read `e.provider_code` (a `ProviderCode` in `rate_limited` / `auth_failed` / `provider_unavailable` / `invalid_request` / `context_length_exceeded` / `content_filtered` / `unknown`) and `e.status_code`.
+- OpenRouter reports a failure after processing started as HTTP 200 with an `error` object (top-level, or on `choices[0]` with `finish_reason: "error"`); that also raises a `ConnectorError`. `e.status_code` is the HTTP status the response arrived with (the 2xx); `e.provider_code` comes from `error.code` (a numeric code is classified as that HTTP status, a string code such as `insufficient_quota` by its meaning), else `unknown`. The vendor's code stays on `e.cause["raw"]`.
 - `Retry-After` rides on `e.cause["retryAfter"]` / `e.cause["retryAfterSeconds"]`; raw body on `e.cause["raw"]`.
 - Provider-routing controls + sub-baseline fields go via `Passthrough(body=..., headers=..., query=...)`; response extras on `res.raw`.

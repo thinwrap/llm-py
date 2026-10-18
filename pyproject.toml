@@ -1,19 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "thinwrap-llm"
-version = "1.0.0"
+version = "1.1.0"
 description = "Lightweight, SDK-free, zero-dependency Python wrapper for chat completions (with streaming) and embeddings across 18 LLM providers behind one normalized surface."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Dmitry Polyanovsky" }]
 keywords = ["llm", "ai", "chat", "embeddings", "openai", "anthropic", "bedrock", "gemini", "streaming"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
-    "License :: OSI Approved :: MIT License",
     "Typing :: Typed",
 ]
 dependencies = []
@@ -29,6 +29,11 @@ Repository = "https://github.com/thinwrap/llm-py"
 where = ["src"]
 include = ["thinwrap.llm*"]
 namespaces = true
+
+# Explicit so the PEP 561 marker ships whatever setuptools the build resolves,
+# rather than relying on a default.
+[tool.setuptools.package-data]
+"thinwrap.llm" = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,16 +4,24 @@ name: Publish to PyPI
 #
 # PyPI supports a "pending" trusted publisher: configure it on PyPI BEFORE the
 # project exists (pypi.org -> Account settings -> Publishing -> "Add a pending
-# publisher") pointing at PyPI project `thinwrap-llm`, owner `thinwrap`,
-# repository `llm-py`, workflow `release.yml`, environment left blank. The first
-# `v*.*.*` tag push then both creates the project and publishes it — no manual
-# bootstrap. This is the Python analogue of npm OIDC trusted publishing.
+# publisher") pointing at PyPI project `thinwrap-llm`, owner
+# `thinwrap`, repository `llm-py`, workflow `release.yml`, environment
+# `pypi`. The first `v*.*.*` tag push then both creates the project and
+# publishes it — no manual bootstrap. This is the Python analogue of npm OIDC
+# trusted publishing. Binding the publisher to the environment means PyPI
+# accepts an upload only from the `publish` job, never from another job or
+# workflow in the repository.
 #
-# The publish job runs the lib's own gates (import smoke + coverage) against the
-# tagged commit before building, so a red release never reaches PyPI.
+# Two jobs. `build` runs the lib's own gates (import smoke + coverage) against
+# the tagged commit and builds the sdist + wheel; it installs unpinned dev
+# tools (pytest, pytest-cov, build), so it gets no OIDC token. `publish` holds
+# `id-token: write`, installs nothing, and only uploads the artifacts `build`
+# produced, so a red build never reaches PyPI and no installed tool ever holds
+# the OIDC token. It does not make the build tamper-proof: a compromised dev
+# tool in `build` could still alter `dist/` before it is uploaded.
 #
-# Trigger: push of a `v*.*.*` tag (branch protection on `main` ensures the
-# tag's commit is on a protected branch).
+# Trigger: push of a `v*.*.*` tag. Branch protection does not cover tags, so
+# the build refuses to continue unless the tagged commit is on `main`.
 
 on:
   push:
@@ -28,16 +36,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: build, gate, publish thinwrap-llm
+  build:
+    name: gate + build thinwrap-llm
     runs-on: ubuntu-latest
     permissions:
-      id-token: write     # required for PyPI OIDC trusted publishing
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0    # full history for the on-main ancestry check
+          # The job only reads the repo; don't leave GITHUB_TOKEN in .git/config
+          # where the unpinned dev tools could read it.
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      # Tags bypass branch protection; without this, a tag on any commit
+      # (for example on an unmerged branch) would publish to PyPI.
+      - name: Verify the tagged commit is on main
+        # fetch-depth: 0 already fetched every branch into refs/remotes/origin/*;
+        # a second `git fetch` would need the credentials not persisted above.
+        run: |
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || {
+            echo "::error::origin/main was not fetched; refusing to publish."
+            exit 1
+          }
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on main; refusing to publish."
+            exit 1
+          fi
+          echo "Tagged commit $GITHUB_SHA is on main."
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
@@ -65,5 +93,37 @@ jobs:
       - name: Build sdist + wheel
         run: python -m build
 
+      - name: Verify the wheel ships py.typed
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected one wheel, found {wheels}")
+          if "thinwrap/llm/py.typed" not in zipfile.ZipFile(wheels[0]).namelist():
+              sys.exit("py.typed missing from the wheel")
+          print("py.typed present in", wheels[0])
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish thinwrap-llm
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi     # must match the environment on the PyPI trusted publisher
+    permissions:
+      id-token: write     # required for PyPI OIDC trusted publishing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
       - name: Publish to PyPI (OIDC trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from .config import OpenAICompatConfig
@@ -38,7 +38,9 @@ class Embeddings:
     """Embeddings facade — a separate operation from Chat. Only the OpenAI-float
     subset of providers is supported."""
 
-    def __init__(self, provider_id, config: OpenAICompatConfig, *, transport: Optional[Transport] = None) -> None:
+    def __init__(
+        self, provider_id: ProviderID | str, config: OpenAICompatConfig, *, transport: Optional[Transport] = None
+    ) -> None:
         try:
             self.provider_id = ProviderID(provider_id)
         except ValueError:

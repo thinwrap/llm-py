@@ -17,7 +17,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Iterator, Mapping, Optional, Protocol, runtime_checkable
 
-from .errors import ConnectorError, ProviderCode
+from .errors import ConnectorError, ProviderCode, invalid_request
 
 # Hard cap on a single SSE line. http.client's readline() is otherwise
 # unbounded, so a newline-less streaming body would grow memory without limit
@@ -47,23 +47,76 @@ def _split_sse_lines(text: str) -> list[str]:
 _ALLOWED_SCHEMES = ("https",)
 
 # Default socket timeout (seconds) so a blackholed connection cannot hang the
-# calling thread indefinitely. Consumers needing a different budget inject their
-# own Transport.
-_DEFAULT_TIMEOUT_SECONDS = 60.0
+# calling thread indefinitely. It bounds each blocking read, not the whole call,
+# but a non-streaming request sends nothing until the model is done, so a long
+# reasoning call needs the full budget: 600 s matches the official OpenAI and
+# Anthropic SDK defaults. Consumers needing a different budget pass
+# UrllibTransport(timeout=...) or inject their own Transport.
+_DEFAULT_TIMEOUT_SECONDS = 600.0
 
 
 def _assert_http_scheme(url: str) -> None:
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
-        raise urllib.error.URLError(f"unsupported URL scheme: {scheme or '(none)'}")
+        # A configuration problem, not an unreachable provider, so a typed
+        # invalid_request that says what to do. The URL is never echoed: a
+        # self-hosted base URL may carry userinfo credentials.
+        raise _scheme_refused(scheme)
 
 
-@dataclass(frozen=True)
+def _scheme_refused(scheme: str) -> ConnectorError:
+    if scheme == "http":
+        return invalid_request(
+            "The default transport is HTTPS-only and refuses http:// URLs. To reach a "
+            "cleartext http endpoint (e.g. a local vLLM, Ollama or LM Studio server), "
+            "inject your own Transport via the facade's transport= argument."
+        )
+    return invalid_request(
+        f"The default transport only sends https:// URLs (got scheme: {scheme or '(none)'}). "
+        "Inject your own Transport via the facade's transport= argument for anything else."
+    )
+
+
+# Header values a repr may show; every other value (Authorization, x-api-key,
+# x-goog-api-key, X-Amz-Security-Token, …) is a credential or may be.
+_REPR_VISIBLE_HEADERS = frozenset({
+    "accept", "content-type", "content-length", "user-agent", "host",
+    "x-amz-date", "x-amz-content-sha256", "anthropic-version",
+})
+
+
+@dataclass(frozen=True, repr=False)
 class HttpRequest:
     method: str
     url: str
     headers: Mapping[str, str] = field(default_factory=dict)
     body: Optional[bytes] = None
+
+    def __repr__(self) -> str:
+        # A BYO transport that logs its request must not log credentials: header
+        # values hold API keys and session tokens, a passthrough query can hold a
+        # token, and the body is the caller's prompt. Only the origin, header
+        # names and safe header values, and the body size are shown.
+        # Never raises: a repr runs inside logging, so a malformed URL (bad port,
+        # non-string) must still render.
+        try:
+            parts = urllib.parse.urlsplit(str(self.url))
+            # netloc minus any userinfo; the raw port text, never parsed.
+            host = parts.netloc.rpartition("@")[2]
+            url = f"{parts.scheme}://{host}" + ("/<redacted>" if (parts.path not in ("", "/") or parts.query) else "")
+        except Exception:
+            url = "<redacted>"
+        try:
+            headers = {
+                k: (v if str(k).lower() in _REPR_VISIBLE_HEADERS else "<redacted>") for k, v in self.headers.items()
+            }
+        except Exception:
+            headers = {"<unreadable>": "<redacted>"}
+        try:
+            size = "None" if self.body is None else f"<{len(self.body)} bytes>"
+        except Exception:
+            size = "<unknown size>"
+        return f"HttpRequest(method={self.method!r}, url={url!r}, headers={headers!r}, body={size})"
 
 
 @dataclass(frozen=True)
@@ -140,6 +193,19 @@ class _UrllibStream(StreamResponse):
             pass
 
 
+# Cloudflare-fronted vendor APIs (Groq, among others) answer urllib's
+# default `Python-urllib/3.x` User-Agent with 403 "error code: 1010", so the
+# default transport names itself. A User-Agent already on the request wins.
+_USER_AGENT = "thinwrap-llm-python"
+
+
+def _with_user_agent(headers: Mapping[str, str]) -> dict:
+    out = dict(headers)
+    if not any(k.lower() == "user-agent" for k in out):
+        out["User-Agent"] = _USER_AGENT
+    return out
+
+
 class UrllibTransport:
     """Default synchronous transport built on the standard library."""
 
@@ -149,7 +215,7 @@ class UrllibTransport:
 
     def send(self, request: HttpRequest) -> HttpResponse:
         _assert_http_scheme(request.url)
-        req = urllib.request.Request(request.url, data=request.body, method=request.method, headers=dict(request.headers))
+        req = urllib.request.Request(request.url, data=request.body, method=request.method, headers=_with_user_agent(request.headers))
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 return HttpResponse(status=resp.status, headers=_lower_headers(resp.headers), body=resp.read())
@@ -158,7 +224,7 @@ class UrllibTransport:
 
     def open_stream(self, request: HttpRequest) -> StreamResponse:
         _assert_http_scheme(request.url)
-        req = urllib.request.Request(request.url, data=request.body, method=request.method, headers=dict(request.headers))
+        req = urllib.request.Request(request.url, data=request.body, method=request.method, headers=_with_user_agent(request.headers))
         try:
             return _UrllibStream(self._opener.open(req, timeout=self._timeout))
         except urllib.error.HTTPError as exc:

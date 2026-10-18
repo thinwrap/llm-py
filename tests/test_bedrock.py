@@ -15,7 +15,7 @@ from helpers import FakeTransport, body_json, path_of, resp
 import thinwrap.llm as llm
 from thinwrap.llm._awssigv4 import SigV4Params, sign_aws_v4
 
-_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+_MODEL = "anthropic.claude-sonnet-4-5-20250929-v1:0"
 _HOST = "bedrock-runtime.us-east-1.amazonaws.com"
 
 
@@ -253,12 +253,15 @@ def test_stream_fallback_deltas():
 
 
 def test_error_mapping_throttling():
-    t = FakeTransport(resp(400, '{"message":"Request was throttled, please slow down","__type":"ThrottlingException"}'))
+    # ThrottlingException is documented as HTTP 429, its shape name in the
+    # x-amzn-ErrorType header.
+    t = FakeTransport(resp(429, '{"message":"Too many requests, please wait before trying again."}',
+                           x_amzn_errortype="ThrottlingException:http://internal.amazon.com/coral/com.amazon.bedrock/"))
     with pytest.raises(llm.ConnectorError) as ei:
         _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
     assert ei.value.provider_code is llm.ProviderCode.RATE_LIMITED
-    assert ei.value.status_code == 400
-    assert "throttled" in ei.value.provider_message
+    assert ei.value.status_code == 429
+    assert ei.value.provider_message == "Too many requests, please wait before trying again."
 
 
 def test_error_mapping_auth():
@@ -337,3 +340,162 @@ def test_bedrock_content_type_sign_equals_send():
     # SIGNED value == SENT value (application/json), NOT the override.
     assert req.headers["Authorization"] == _resign(req, path=canonical, content_type="application/json")
     assert req.headers["Authorization"] != _resign(req, path=canonical, content_type="application/x-amz-json-1.1")
+
+
+@pytest.mark.parametrize("body", ["{}", '{"stopReason":"end_turn","usage":{"inputTokens":1}}', '{"output":null}'])
+def test_complete_200_without_output_object_is_empty_body_error(body):
+    with pytest.raises(llm.ConnectorError) as ei:
+        _chat(FakeTransport(resp(200, body))).complete(
+            llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="hi")])
+        )
+    assert ei.value.provider_code is llm.ProviderCode.PROVIDER_UNAVAILABLE
+    assert ei.value.status_code == 200
+
+
+_OK = '{"output":{"message":{"content":[{"text":"x"}]}},"stopReason":"end_turn"}'
+
+
+@pytest.mark.parametrize(
+    "status,etype,message,expected",
+    [
+        (408, "ModelTimeoutException", "Model has timed out in processing the request.", llm.ProviderCode.PROVIDER_UNAVAILABLE),
+        (424, "ModelErrorException", "The model returned an error.", llm.ProviderCode.PROVIDER_UNAVAILABLE),
+        (400, "ValidationException", "Input is too long for requested model.", llm.ProviderCode.CONTEXT_LENGTH_EXCEEDED),
+        (400, "ValidationException", "Value at 'requestMetadata' failed to satisfy constraint: string too long", llm.ProviderCode.INVALID_REQUEST),
+        (400, "ValidationException", "The model returned the following errors: max_tokens: 0 < 1", llm.ProviderCode.INVALID_REQUEST),
+        (400, "ThrottlingException", "Rate exceeded", llm.ProviderCode.RATE_LIMITED),
+    ],
+)
+def test_error_classification(status, etype, message, expected):
+    t = FakeTransport(resp(status, json.dumps({"message": message}), x_amzn_errortype=etype))
+    with pytest.raises(llm.ConnectorError) as ei:
+        _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert ei.value.provider_code is expected
+
+
+def test_error_type_from_namespaced_body_type():
+    t = FakeTransport(resp(400, '{"__type":"com.amazon.coral.availability#ThrottlingException","message":"Rate exceeded"}'))
+    with pytest.raises(llm.ConnectorError) as ei:
+        _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert ei.value.provider_code is llm.ProviderCode.RATE_LIMITED
+
+
+def test_usage_counts_cache_read_and_write_as_input():
+    body = json.dumps({
+        "output": {"message": {"content": [{"text": "x"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 132, "cacheReadInputTokens": 100, "cacheWriteInputTokens": 20},
+    })
+    res = _chat(FakeTransport(resp(200, body))).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert (res.usage.input_tokens, res.usage.output_tokens, res.usage.total_tokens) == (125, 7, 132)
+
+
+def test_usage_total_stays_consistent_when_vendor_total_excludes_cache():
+    body = json.dumps({
+        "output": {"message": {"content": [{"text": "x"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12, "cacheReadInputTokens": 100},
+    })
+    res = _chat(FakeTransport(resp(200, body))).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert (res.usage.input_tokens, res.usage.total_tokens) == (105, 112)
+
+
+def test_model_context_window_exceeded_maps_to_length():
+    body = '{"output":{"message":{"content":[{"text":"x"}]}},"stopReason":"model_context_window_exceeded"}'
+    res = _chat(FakeTransport(resp(200, body))).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert res.finish_reason == "length"
+
+
+def test_tool_choice_none_omits_tool_config():
+    t = FakeTransport(resp(200, _OK))
+    _chat(t).complete(llm.ChatInput(
+        model=_MODEL,
+        messages=[llm.ChatMessage(role="user", content="x")],
+        tools=[llm.ToolDefinition(name="f")],
+        tool_choice=llm.ToolChoice(mode="none"),
+    ))
+    assert "toolConfig" not in body_json(t.last)
+
+
+@pytest.mark.parametrize("region", ["us-east-1.evil.example/x", "us-east-1@evil.example", "US-EAST-1", "", "us east 1"])
+def test_region_must_be_a_region_name(region):
+    with pytest.raises(llm.ConnectorError) as ei:
+        llm.Chat(llm.ProviderID.BEDROCK, _cfg(region=region), transport=FakeTransport())
+    assert ei.value.provider_code is llm.ProviderCode.INVALID_REQUEST
+
+
+def test_default_https_port_is_not_signed_into_host():
+    t = FakeTransport(resp(200, _OK))
+    _chat(t, base_url=f"https://{_HOST}:443").complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="hi")]))
+    canonical = "/model/" + quote(quote(_MODEL, safe=""), safe="") + "/converse"
+    assert t.last.headers["Authorization"] == _resign(t.last, path=canonical, content_type="application/json")
+
+
+def test_headers_merge_case_insensitively_before_signing():
+    t = FakeTransport(resp(200, _OK))
+    _chat(t, headers={"x-trace": "cfg", "content-type": "text/plain"}).complete(llm.ChatInput(
+        model=_MODEL,
+        messages=[llm.ChatMessage(role="user", content="hi")],
+        passthrough=llm.Passthrough(headers={"X-Trace": "req"}),
+    ))
+    names = [k.lower() for k in t.last.headers]
+    assert names.count("x-trace") == 1 and names.count("content-type") == 1
+    assert t.last.headers["X-Trace"] == "req"
+    assert t.last.headers["Content-Type"] == "application/json"
+
+
+@pytest.mark.parametrize("status,expected", [(402, llm.ProviderCode.RATE_LIMITED), (413, llm.ProviderCode.INVALID_REQUEST)])
+def test_402_is_rate_limited_and_413_invalid_request(status, expected):
+    t = FakeTransport(resp(status, '{"message":"nope"}'))
+    with pytest.raises(llm.ConnectorError) as ei:
+        _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert ei.value.provider_code is expected
+
+
+# ---- review-5 ----
+
+
+def test_total_tokens_is_input_plus_output():
+    body = json.dumps({
+        "output": {"message": {"content": [{"text": "x"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 999, "cacheWriteInputTokens": 20},
+    })
+    res = _chat(FakeTransport(resp(200, body))).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert (res.usage.input_tokens, res.usage.total_tokens) == (25, 32)
+
+
+def test_base_url_path_prefix_is_signed():
+    t = FakeTransport(resp(200, _OK))
+    _chat(t, base_url=f"https://{_HOST}/gateway/bedrock").complete(
+        llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="hi")])
+    )
+    assert path_of(t.last) == f"/gateway/bedrock/model/{quote(_MODEL, safe='')}/converse"
+    canonical = "/gateway/bedrock/model/" + quote(quote(_MODEL, safe=""), safe="") + "/converse"
+    assert t.last.headers["Authorization"] == _resign(t.last, path=canonical, content_type="application/json")
+    unprefixed = "/model/" + quote(quote(_MODEL, safe=""), safe="") + "/converse"
+    assert t.last.headers["Authorization"] != _resign(t.last, path=unprefixed, content_type="application/json")
+
+
+def test_empty_text_parts_are_dropped():
+    t = FakeTransport(resp(200, _OK))
+    _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[
+        llm.ChatMessage(role="user", content_parts=[llm.text_part(""), llm.text_part("hi")]),
+    ]))
+    assert body_json(t.last)["messages"][0]["content"] == [{"text": "hi"}]
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("The model returned the following errors: prompt is too long: 205000 tokens > 200000 maximum", llm.ProviderCode.CONTEXT_LENGTH_EXCEEDED),
+        ("This model's maximum context length is 128000 tokens.", llm.ProviderCode.CONTEXT_LENGTH_EXCEEDED),
+        ("Too many tokens per day, please wait before trying again.", llm.ProviderCode.INVALID_REQUEST),
+        ("context window settings are invalid", llm.ProviderCode.INVALID_REQUEST),
+    ],
+)
+def test_context_overflow_phrases(message, expected):
+    t = FakeTransport(resp(400, json.dumps({"message": message}), x_amzn_errortype="ValidationException"))
+    with pytest.raises(llm.ConnectorError) as ei:
+        _chat(t).complete(llm.ChatInput(model=_MODEL, messages=[llm.ChatMessage(role="user", content="x")]))
+    assert ei.value.provider_code is expected

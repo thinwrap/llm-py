@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 from .config import OpenAICompatConfig
 from .enums import ProviderID
@@ -18,6 +18,7 @@ class OpenAICompatSpec:
     max_tokens_field: str = "max_tokens"
     stream_usage_path: str = ""  # "x_groq" relocates streaming usage
     strict_params: bool = False
+    dimensions_field: str = "dimensions"  # embeddings output-size field
 
 
 def _bearer(cfg: OpenAICompatConfig) -> dict:
@@ -29,15 +30,26 @@ def _azure(cfg: OpenAICompatConfig) -> dict:
 
 
 SPECS: dict = {
-    ProviderID.OPENAI: OpenAICompatSpec(ProviderID.OPENAI, "https://api.openai.com/v1", _bearer),
-    ProviderID.AZURE_OPENAI: OpenAICompatSpec(ProviderID.AZURE_OPENAI, "", _azure),
+    # OpenAI deprecates `max_tokens` in favor of `max_completion_tokens` (the
+    # only one o-series/reasoning models accept); Azure's reasoning models on the
+    # v1 API likewise reject `max_tokens`.
+    ProviderID.OPENAI: OpenAICompatSpec(
+        ProviderID.OPENAI, "https://api.openai.com/v1", _bearer, max_tokens_field="max_completion_tokens"
+    ),
+    ProviderID.AZURE_OPENAI: OpenAICompatSpec(
+        ProviderID.AZURE_OPENAI, "", _azure, max_tokens_field="max_completion_tokens"
+    ),
     ProviderID.OPENROUTER: OpenAICompatSpec(ProviderID.OPENROUTER, "https://openrouter.ai/api/v1", _bearer),
     ProviderID.GROQ: OpenAICompatSpec(ProviderID.GROQ, "https://api.groq.com/openai/v1", _bearer, stream_usage_path="x_groq"),
     ProviderID.TOGETHER: OpenAICompatSpec(ProviderID.TOGETHER, "https://api.together.ai/v1", _bearer),
     ProviderID.FIREWORKS: OpenAICompatSpec(ProviderID.FIREWORKS, "https://api.fireworks.ai/inference/v1", _bearer),
     ProviderID.DEEPSEEK: OpenAICompatSpec(ProviderID.DEEPSEEK, "https://api.deepseek.com/v1", _bearer),
     ProviderID.XAI: OpenAICompatSpec(ProviderID.XAI, "https://api.x.ai/v1", _bearer),
-    ProviderID.MISTRAL: OpenAICompatSpec(ProviderID.MISTRAL, "https://api.mistral.ai/v1", _bearer, strict_params=True),
+    # Mistral's embeddings API has no `dimensions`; its output size is
+    # `output_dimension`.
+    ProviderID.MISTRAL: OpenAICompatSpec(
+        ProviderID.MISTRAL, "https://api.mistral.ai/v1", _bearer, strict_params=True, dimensions_field="output_dimension"
+    ),
     ProviderID.PERPLEXITY: OpenAICompatSpec(ProviderID.PERPLEXITY, "https://api.perplexity.ai", _bearer, supports_tools=False),
     ProviderID.DEEPINFRA: OpenAICompatSpec(ProviderID.DEEPINFRA, "https://api.deepinfra.com/v1/openai", _bearer),
     ProviderID.CLOUDFLARE: OpenAICompatSpec(ProviderID.CLOUDFLARE, "", _bearer),
